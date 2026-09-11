@@ -1,5 +1,6 @@
 ﻿using Microsoft.Data.SqlClient;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Storage;
 using PropertySearch.Web.Models;
 using System.Data;
 using System.Diagnostics;
@@ -30,28 +31,63 @@ namespace PropertySearch.Web.Data
             ("Northern Cape", ["Royldene", "Hadison Park"])
         ];
 
-        public static async Task SeedAsync(PropertyDbContext context, string connectionString)
+        public static async Task SeedAsync(PropertyDbContext context)
         {
+            // One transaction for the whole seed: an application lock, the
+            // regions, and all 250,000 properties. A run that dies partway
+            // rolls back completely, so the next startup sees an empty
+            // Properties table and seeds again rather than treating a partial
+            // load as done.
+            await using var transaction = await context.Database.BeginTransactionAsync();
+
+            // Serialises concurrent startups. Held until the transaction ends,
+            // so it is released by the commit or the rollback either way — the
+            // second process then sees the committed rows and returns.
+            await AcquireSeedLockAsync(context);
+
             if (await context.Properties.AnyAsync())
                 return;
 
             var suburbIds = await SeedRegionsAsync(context);
-            await BulkInsertPropertiesAsync(connectionString, suburbIds);
+            await BulkInsertPropertiesAsync(context, suburbIds);
+
+            await transaction.CommitAsync();
         }
+
+        private static Task AcquireSeedLockAsync(PropertyDbContext context) =>
+            context.Database.ExecuteSqlRawAsync(
+                """
+                DECLARE @result int;
+                EXEC @result = sp_getapplock
+                    @Resource = 'PropertySearch:Seed',
+                    @LockMode = 'Exclusive',
+                    @LockOwner = 'Transaction',
+                    @LockTimeout = 300000;
+                IF @result < 0
+                    THROW 50000, 'Could not acquire the PropertySearch seed lock.', 1;
+                """);
 
         private static async Task<int[]> SeedRegionsAsync(PropertyDbContext context)
         {
-            if (await context.Provinces.AnyAsync())
-                return await context.Suburbs.Select(s => s.Id).ToArrayAsync();
-
+            // Reconciled by name rather than skipped wholesale on "are there
+            // any provinces?" — a half-written region set would otherwise
+            // leave us with provinces but no suburbs to hang properties on.
             foreach (var (provinceName, suburbNames) in Regions)
             {
-                var province = new Province { Name = provinceName };
-                context.Provinces.Add(province);
+                var province = await context.Provinces
+                    .Include(p => p.Suburbs)
+                    .FirstOrDefaultAsync(p => p.Name == provinceName);
+
+                if (province is null)
+                {
+                    province = new Province { Name = provinceName };
+                    context.Provinces.Add(province);
+                }
 
                 foreach (var suburbName in suburbNames)
                 {
-                    province.Suburbs.Add(new Suburb { Name = suburbName });
+                    if (!province.Suburbs.Any(s => s.Name == suburbName))
+                        province.Suburbs.Add(new Suburb { Name = suburbName });
                 }
             }
 
@@ -59,19 +95,27 @@ namespace PropertySearch.Web.Data
             // tracking costs nothing here and it resolves the FK graph for us.
             await context.SaveChangesAsync();
 
-            return await context.Suburbs.Select(s => s.Id).ToArrayAsync();
+            var suburbIds = await context.Suburbs.Select(s => s.Id).ToArrayAsync();
+
+            if (suburbIds.Length == 0)
+                throw new InvalidOperationException(
+                    "Region seeding produced no suburbs to assign properties to.");
+
+            return suburbIds;
         }
 
-        private static async Task BulkInsertPropertiesAsync(string connectionString, int[] suburbIds)
+        private static async Task BulkInsertPropertiesAsync(PropertyDbContext context, int[] suburbIds)
         {
             var stopwatch = Stopwatch.StartNew();
 
             var table = BuildPropertyTable(suburbIds);
 
-            await using var connection = new SqlConnection(connectionString);
-            await connection.OpenAsync();
+            // The context's own connection and transaction, so the bulk copy
+            // commits or rolls back with the regions it depends on.
+            var connection = (SqlConnection)context.Database.GetDbConnection();
+            var transaction = (SqlTransaction)context.Database.CurrentTransaction!.GetDbTransaction();
 
-            using var bulkCopy = new SqlBulkCopy(connection)
+            using var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction)
             {
                 DestinationTableName = "Properties",
                 BatchSize = 10_000,
@@ -116,15 +160,17 @@ namespace PropertySearch.Web.Data
                 var propertyType = PickPropertyType(random);
                 var bedrooms = PickBedrooms(random, propertyType);
                 var price = PickPrice(random, propertyType, bedrooms);
+                var listingType = random.Next(100) < 80
+                    ? ListingType.ForSale
+                    : ListingType.ToRent;
 
                 var row = table.NewRow();
 
-                row["Title"] = $"{bedrooms} bedroom {propertyType} for sale";
+                row["Title"] = $"{bedrooms} bedroom {propertyType} " +
+                               (listingType == ListingType.ForSale ? "for sale" : "to rent");
                 row["Description"] = DBNull.Value;
                 row["PropertyType"] = (int)propertyType;
-                row["ListingType"] = random.Next(100) < 80
-                    ? (int)ListingType.ForSale
-                    : (int)ListingType.ToRent;
+                row["ListingType"] = (int)listingType;
                 row["Price"] = price;
                 row["Bedrooms"] = bedrooms;
                 row["Bathrooms"] = Math.Max(1, bedrooms - random.Next(0, 2));

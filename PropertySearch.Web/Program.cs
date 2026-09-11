@@ -23,9 +23,12 @@ if (app.Environment.IsDevelopment())
 {
     using var scope = app.Services.CreateScope();
     var context = scope.ServiceProvider.GetRequiredService<PropertyDbContext>();
-    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")!;
 
-    await SeedData.SeedAsync(context, connectionString);
+    // Before the seed, not after — a reset database has no Properties table
+    // for the seeder's "is this already seeded?" check to query.
+    await context.Database.MigrateAsync();
+
+    await SeedData.SeedAsync(context);
 }
 
 // Configure the HTTP request pipeline.
