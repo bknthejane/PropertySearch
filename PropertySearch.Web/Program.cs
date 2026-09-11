@@ -19,6 +19,18 @@ builder.Services.AddDbContext<PropertyDbContext>(options =>
 
 var app = builder.Build();
 
+if (app.Environment.IsDevelopment())
+{
+    using var scope = app.Services.CreateScope();
+    var context = scope.ServiceProvider.GetRequiredService<PropertyDbContext>();
+
+    // Before the seed, not after — a reset database has no Properties table
+    // for the seeder's "is this already seeded?" check to query.
+    await context.Database.MigrateAsync();
+
+    await SeedData.SeedAsync(context);
+}
+
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
 {

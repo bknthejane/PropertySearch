@@ -31,8 +31,8 @@ believe the fix worked.
 Early. Building in order:
 
 - [x] MVC project scaffolded with EF Core and SQL logging
-- [ ] Property domain model and migration
-- [ ] 250,000 rows seeded via bulk insert
+- [x] Property domain model and migration
+- [x] 250,000 rows seeded via bulk insert
 - [ ] Search view model, filters and Razor form
 - [ ] Pagination with a bounded page and capped page size
 - [ ] **Baseline measurements, before any optimisation**
@@ -44,7 +44,8 @@ Early. Building in order:
 ## Findings
 
 The summary. Each row is a query, its timing before and after, and the plan
-operator that explained it.
+operator that explained it. Every timing, with the machine it was taken on and
+the method behind it, is recorded in [docs/measurements.md](docs/measurements.md).
 
 | Query | Before | After | What the plan showed |
 |---|---|---|---|
@@ -130,9 +131,15 @@ Set your connection string in
 Then:
 
 ```bash
-dotnet ef database update --project PropertySearch.Web
 dotnet run --project PropertySearch.Web
 ```
+
+In Development the app applies the migrations and then seeds 250,000
+properties on startup, so there is no separate `dotnet ef database update`
+step. The seed runs in one transaction behind an application lock: it either
+lands completely or not at all, and a second run against a seeded database
+does nothing. First startup takes a few seconds longer for the bulk insert —
+see [docs/measurements.md](docs/measurements.md).
 
 Generated SQL is logged to the console in Development, with real parameter
 values rather than placeholders — `EnableSensitiveDataLogging` is on behind an
