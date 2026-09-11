@@ -19,6 +19,15 @@ builder.Services.AddDbContext<PropertyDbContext>(options =>
 
 var app = builder.Build();
 
+if (app.Environment.IsDevelopment())
+{
+    using var scope = app.Services.CreateScope();
+    var context = scope.ServiceProvider.GetRequiredService<PropertyDbContext>();
+    var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")!;
+
+    await SeedData.SeedAsync(context, connectionString);
+}
+
 // Configure the HTTP request pipeline.
 if (!app.Environment.IsDevelopment())
 {
